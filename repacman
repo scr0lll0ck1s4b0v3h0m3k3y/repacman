@@ -1,0 +1,197 @@
+#!/bin/bash
+
+# First, check if dialog is installed
+if ! command -v dialog >/dev/null 2>&1; then
+    echo "This script requires 'dialog'. Please install it first."
+    exit 1
+fi
+
+# Cleanup function to reset terminal
+cleanup() {
+    clear
+    stty echo
+    tput rmcup
+    tput cnorm
+    exit
+}
+
+# Function to format time difference
+format_time_ago() {
+    local seconds=$1
+    local minutes=$((seconds / 60))
+    local hours=$((minutes / 60))
+    
+    if [ $minutes -lt 60 ]; then
+        echo "${minutes}m ago"
+    else
+        echo "${hours}h ago"
+    fi
+}
+
+# Trap signals to ensure proper cleanup
+trap cleanup EXIT INT TERM
+
+# Initialize terminal
+tput smcup
+tput civis
+
+# Check if running as root or with sudo
+if [ "$EUID" -ne 0 ]; then
+    dialog --title "Error" --msgbox "Please run as root or with sudo" 6 40
+    exit 1
+fi
+
+# Check if the cache directory exists
+if [ ! -d "/var/cache/pacman/pkg/" ]; then
+    dialog --title "Error" --msgbox "Package cache directory not found!" 6 40
+    exit 1
+fi
+
+# Function to show time selection menu
+get_time_period() {
+    local choice
+    choice=$(dialog --clear --title "Time Period Selection" \
+        --cancel-label "Exit" \
+        --menu "Select the time period to search for packages:" 17 60 10 \
+        "1" "Last 1 hour" \
+        "3" "Last 3 hours" \
+        "6" "Last 6 hours" \
+        "12" "Last 12 hours" \
+        "24" "Last 24 hours" \
+        "48" "Last 48 hours" \
+        "72" "Last 72 hours (3 days)" \
+        "168" "Last week (7 days)" \
+        "C" "Custom hours" \
+        "abort" "Exit program" 2>&1 >/dev/tty)
+    
+    # Check return status
+    local ret=$?
+    if [ $ret -ne 0 ] || [ "$choice" = "abort" ]; then
+        cleanup  # Call cleanup function directly
+    fi
+
+    if [ "$choice" = "C" ]; then
+        CUSTOM_HOURS=$(dialog --title "Custom Time Period" \
+            --inputbox "Enter number of hours to look back:\n\nSelect Cancel to go back" 10 40 2>&1 >/dev/tty)
+        
+        [ $? -ne 0 ] && return 1
+
+        if ! [[ "$CUSTOM_HOURS" =~ ^[0-9]+$ ]]; then
+            dialog --title "Error" --msgbox "Please enter a valid positive number" 6 40
+            return 1
+        fi
+        HOURS=$CUSTOM_HOURS
+    else
+        HOURS=$choice
+    fi
+    return 0
+}
+
+# Function to search packages
+search_packages() {
+    # Convert hours to minutes for find command
+    MINUTES=$((HOURS * 60))
+    
+    # Get current timestamp
+    NOW=$(date +%s)
+
+    # Create a temporary file to store package information
+    TEMP_FILE=$(mktemp)
+    SORT_FILE=$(mktemp)
+
+    # Find files and process them with timestamps
+    while IFS= read -r file; do
+        FILE_TIME=$(stat -c %Y "$file")
+        TIME_DIFF=$((NOW - FILE_TIME))
+        TIME_AGO=$(format_time_ago $TIME_DIFF)
+        PKG_NAME=$(basename "$file" | sed 's/-[0-9].*$//')
+        # Store timestamp and formatted line for sorting
+        echo "$FILE_TIME • $PKG_NAME ($TIME_AGO)" >> "$SORT_FILE"
+    done < <(find /var/cache/pacman/pkg/ -type f -name "*.pkg.tar.zst" -mmin -$MINUTES)
+
+    if [ ! -s "$SORT_FILE" ]; then
+        dialog --title "No Packages Found" \
+            --msgbox "No packages found from last $HOURS hours in cache" 6 50
+        rm "$TEMP_FILE" "$SORT_FILE"
+        return 1
+    fi
+
+    # Sort by timestamp (first field) in reverse order (newest first)
+    # Then remove the timestamp from the output
+    FORMATTED_PACKAGES=$(sort -rn "$SORT_FILE" | cut -d' ' -f2-)
+    PACKAGE_COUNT=$(echo "$FORMATTED_PACKAGES" | wc -l)
+
+    # Show found packages with options
+    dialog --title "Found Packages" --cr-wrap --scrollbar \
+        --yes-label "Continue" --no-label "Abort" \
+        --yesno "Found $PACKAGE_COUNT packages from last $HOURS hours:\n\n$FORMATTED_PACKAGES" 24 78
+    
+    [ $? -ne 0 ] && { rm "$TEMP_FILE" "$SORT_FILE"; return 1; }
+
+    # Create detailed file list
+    FILE_LIST=$(find /var/cache/pacman/pkg/ -type f -name "*.pkg.tar.zst" -mmin -$MINUTES -exec ls -lh {} \; | \
+                sort -r | awk '{print $6, $7, $8, $9}')
+
+    # Extract package names for pacman
+    UNIQUE_PACKAGES=$(echo "$FORMATTED_PACKAGES" | sed 's/• \(.*\) (.*/\1/')
+
+    # Ask about detailed information
+    dialog --title "Detailed Information" \
+        --yes-label "Show Details" --no-label "Skip" \
+        --yesno "Would you like to see detailed file information?" 6 60
+    
+    if [ $? -eq 0 ]; then
+        dialog --title "Detailed File Information" --cr-wrap --scrollbar \
+            --yes-label "Continue" --no-label "Abort" \
+            --yesno "$FILE_LIST" 24 78
+        [ $? -ne 0 ] && { rm "$TEMP_FILE" "$SORT_FILE"; return 1; }
+    fi
+
+    # Cleanup temp files
+    rm "$TEMP_FILE" "$SORT_FILE"
+
+    # Ask for confirmation to reinstall
+    dialog --title "Confirm Reinstallation" \
+        --yes-label "Install" --no-label "Abort" \
+        --yesno "Do you want to reinstall these $PACKAGE_COUNT packages?" 6 60
+    
+    [ $? -ne 0 ] && return 1
+
+    # Restore normal terminal for pacman
+    clear
+    tput rmcup
+    tput cnorm
+    stty echo
+
+    if pacman -S --overwrite "*" $UNIQUE_PACKAGES; then
+        SUCCESS=1
+    else
+        SUCCESS=0
+    fi
+
+    # Return to dialog interface
+    tput smcup
+    tput civis
+
+    if [ "$SUCCESS" = "1" ]; then
+        dialog --title "Success" \
+            --msgbox "Package reinstallation completed successfully" 6 45
+    else
+        dialog --title "Error" \
+            --msgbox "Error occurred during package reinstallation" 6 45
+    fi
+}
+
+# Main program loop
+while true; do
+    get_time_period || continue
+    search_packages || continue
+
+    dialog --title "Continue?" \
+        --yes-label "New Search" --no-label "Exit" \
+        --yesno "Would you like to perform another search?" 6 45
+    
+    [ $? -ne 0 ] && break
+done
+
+# Cleanup will be called automatically due to trap
